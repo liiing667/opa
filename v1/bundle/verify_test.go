@@ -6,8 +6,16 @@ package bundle
 
 import (
 	"bytes"
+	"encoding/hex"
 	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
+
+	"github.com/open-policy-agent/opa/internal/file/archive"
+	"github.com/open-policy-agent/opa/v1/util"
 )
 
 func TestVerifyBundleSignature(t *testing.T) {
@@ -312,6 +320,167 @@ func TestVerifyBundleFile(t *testing.T) {
 			}
 		})
 	}
+}
+
+func signFilesToken(t *testing.T, files []FileInfo, keyID string) string {
+	t.Helper()
+	token, err := GenerateSignedToken(files, NewSigningConfig("secret", "HS256", ""), keyID)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	return token
+}
+
+func TestVerifyBundleSignatureRejectsAmbiguousFileEntries(t *testing.T) {
+	first := FileInfo{Name: "a/policy.rego", Hash: "42cfe6768b57bb5f7503c165c28dd07ac5b813554ebc850f2cc3584e7137b1bd", Algorithm: SHA256.String()}
+
+	tests := map[string]struct {
+		files   []FileInfo
+		keyID   string
+		errSubs []string
+	}{
+		"duplicate_path_with_two_hashes": {
+			files: []FileInfo{
+				first,
+				{Name: "a/policy.rego", Hash: "0000000000000000000000000000000000000000000000000000000000000000", Algorithm: SHA256.String()},
+			},
+			errSubs: []string{"a/policy.rego", "more than once"},
+		},
+		"conflicting_algorithm": {
+			files: []FileInfo{
+				first,
+				{Name: "a/policy.rego", Hash: "42cfe6768b57bb5f7503c165c28dd07ac5b813554ebc850f2cc3584e7137b1bd", Algorithm: SHA512.String()},
+			},
+			errSubs: []string{"a/policy.rego", "conflicting hashing algorithms"},
+		},
+		"empty_name": {
+			files:   []FileInfo{{Name: "   ", Hash: first.Hash, Algorithm: SHA256.String()}},
+			errSubs: []string{"empty name"},
+		},
+		"case_alias": {
+			files: []FileInfo{
+				first,
+				{Name: "A/Policy.rego", Hash: first.Hash, Algorithm: SHA256.String()},
+			},
+			errSubs: []string{"A/Policy.rego", "case-insensitive"},
+		},
+		"normalization_alias": {
+			files: []FileInfo{
+				first,
+				{Name: "/a//b/../policy.rego", Hash: first.Hash, Algorithm: SHA256.String()},
+			},
+			errSubs: []string{"/a//b/../policy.rego", "more than once"},
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			token := signFilesToken(t, tc.files, "foo")
+			vc := NewVerificationConfig(map[string]*KeyConfig{"foo": {Key: "secret", Algorithm: "HS256"}}, "", "", nil)
+
+			files, err := VerifyBundleSignature(SignaturesConfig{Signatures: []string{token}}, vc)
+			if err == nil {
+				t.Fatal("Expected error but got nil")
+			}
+			for _, sub := range tc.errSubs {
+				if !strings.Contains(err.Error(), sub) {
+					t.Fatalf("Expected error %q to contain %q", err.Error(), sub)
+				}
+			}
+			if len(files) != 0 {
+				t.Fatalf("Expected no files to be returned on failure but got %v", files)
+			}
+		})
+	}
+}
+
+func TestVerifyBundleSignatureNormalizesPathsAndKeepsCompatibility(t *testing.T) {
+	files := []FileInfo{
+		{Name: "/a/b/c/data.json", Hash: "c2131544c716a25a5e31f504300f5240e8235cadb9a57f0bd1b6f4bd74b26612", Algorithm: SHA256.String()},
+		{Name: "/http/policy/policy.rego", Hash: "42cfe6768b57bb5f7503c165c28dd07ac5b813554ebc850f2cc3584e7137b1bd", Algorithm: SHA256.String()},
+	}
+
+	t.Run("normalized_paths_indexed_without_leading_slash", func(t *testing.T) {
+		token := signFilesToken(t, files, "foo")
+		vc := NewVerificationConfig(map[string]*KeyConfig{"foo": {Key: "secret", Algorithm: "HS256"}}, "", "", nil)
+
+		got, err := VerifyBundleSignature(SignaturesConfig{Signatures: []string{token}}, vc)
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		for _, name := range []string{"a/b/c/data.json", "http/policy/policy.rego"} {
+			if _, ok := got[name]; !ok {
+				t.Fatalf("Expected normalized entry %q in %v", name, got)
+			}
+		}
+	})
+
+	t.Run("deprecated_keyid_claim", func(t *testing.T) {
+		token := signFilesToken(t, files, "foo")
+		vc := NewVerificationConfig(map[string]*KeyConfig{"foo": {Key: "secret", Algorithm: "HS256"}}, "", "", nil)
+
+		if _, err := VerifyBundleSignature(SignaturesConfig{Signatures: []string{token}}, vc); err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+	})
+
+	t.Run("signed_bundle_with_scope_and_exclude_files", func(t *testing.T) {
+		hasher, err := NewSignatureHasher(SHA256)
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		hashOf := func(name, data string) string {
+			var value any
+			if IsStructuredDoc(name) {
+				if err := util.Unmarshal([]byte(data), &value); err != nil {
+					t.Fatalf("Unexpected error: %v", err)
+				}
+			} else {
+				value = []byte(data)
+			}
+			bs, err := hasher.HashFile(value)
+			if err != nil {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+			return hex.EncodeToString(bs)
+		}
+
+		manifest := `{"revision": "quickbrownfaux"}`
+		dataFile := "[1,2,3]"
+		policyFile := `package example`
+
+		signedFiles := []FileInfo{
+			NewFile(".manifest", hashOf(".manifest", manifest), SHA256.String()),
+			NewFile("a/b/c/data.json", hashOf("a/b/c/data.json", dataFile), SHA256.String()),
+			NewFile("http/policy/policy.rego", hashOf("http/policy/policy.rego", policyFile), SHA256.String()),
+		}
+
+		claimsPath := filepath.Join(t.TempDir(), "claims.json")
+		if err := os.WriteFile(claimsPath, []byte(`{"scope":"write","iss":"JWTService"}`), 0o600); err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		token, err := GenerateSignedToken(signedFiles, NewSigningConfig("secret", "HS256", claimsPath), "foo")
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+
+		tarFiles := [][2]string{
+			{"/.signatures.json", fmt.Sprintf(`{"signatures": ["%v"]}`, token)},
+			{"/.manifest", manifest},
+			{"/a/b/c/data.json", dataFile},
+			{"/http/policy/policy.rego", policyFile},
+		}
+
+		vc := NewVerificationConfig(
+			map[string]*KeyConfig{"foo": {Key: "secret", Algorithm: "HS256"}},
+			"", "write",
+			[]string{".*", "a/b/c/data.json", "http/policy/policy.rego"},
+		)
+
+		if _, err := NewReader(archive.MustWriteTarGz(tarFiles)).WithBundleVerificationConfig(vc).Read(); err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+	})
 }
 
 type CustomVerifier struct{}

@@ -14,6 +14,10 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"maps"
+	"path"
+	"path/filepath"
+	"strings"
 
 	"github.com/lestrrat-go/jwx/v3/jwa"
 	"github.com/lestrrat-go/jwx/v3/jws/jwsbb"
@@ -108,11 +112,59 @@ func (*DefaultVerifier) VerifyBundleSignature(sc SignaturesConfig, bvc *Verifica
 			return files, err
 		}
 
+		// Validate the full payload before exposing any entries: a malformed
+		// payload must fail closed rather than leaving a partially populated
+		// file index behind.
+		indexed := make(map[string]FileInfo, len(payload.Files))
 		for _, file := range payload.Files {
-			files[file.Name] = file
+			if err := addVerifiedFile(indexed, file); err != nil {
+				return files, err
+			}
 		}
+		maps.Copy(files, indexed)
 	}
 	return files, nil
+}
+
+// normalizeSignaturePath canonicalizes a file name from a JWT payload the
+// same way the loader canonicalizes bundle paths: OS-specific separators are
+// converted to slashes, redundant elements such as "." and ".." are resolved,
+// and leading slashes are trimmed so that names match the bundle-relative
+// paths used during verification.
+func normalizeSignaturePath(name string) string {
+	name = filepath.ToSlash(name)
+	name = path.Clean(name)
+	return strings.TrimPrefix(name, "/")
+}
+
+// addVerifiedFile indexes a verified JWT payload entry by its normalized file
+// path. Duplicate identities, including case-only aliases, conflicting
+// hashing algorithms and empty names, are rejected instead of silently
+// overwriting a previously verified entry.
+func addVerifiedFile(files map[string]FileInfo, file FileInfo) error {
+	normalized := normalizeSignaturePath(file.Name)
+	if normalized == "" || normalized == "." || strings.TrimSpace(normalized) == "" {
+		return fmt.Errorf(".signatures.json: file entry with empty name %q", file.Name)
+	}
+
+	if existing, ok := files[normalized]; ok {
+		if existing.Algorithm != file.Algorithm {
+			return fmt.Errorf(".signatures.json: file %q listed with conflicting hashing algorithms %q and %q",
+				file.Name, existing.Algorithm, file.Algorithm)
+		}
+		return fmt.Errorf(".signatures.json: file %q listed more than once in the JWT payload", file.Name)
+	}
+
+	for existingName := range files {
+		if strings.EqualFold(existingName, normalized) {
+			return fmt.Errorf(".signatures.json: file %q conflicts with already listed path %q after case-insensitive normalization",
+				file.Name, existingName)
+		}
+	}
+
+	file.Name = normalized
+	files[normalized] = file
+	return nil
 }
 
 func verifyJWTSignature(token string, bvc *VerificationConfig) (*DecodedSignature, error) {
